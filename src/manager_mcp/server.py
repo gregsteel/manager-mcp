@@ -1,0 +1,843 @@
+"""FastMCP Manager.io server. Stdio by default; MANAGER_MCP_TRANSPORT=http for
+remote Streamable HTTP + Google OAuth (see http_auth.py). Writes via scope envs."""
+
+from __future__ import annotations
+
+import base64
+import logging
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastmcp import FastMCP
+from mcp.types import Icon
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+
+from manager_mcp import task_tools as _tt
+from manager_mcp.bank_feeds import (
+    bank_feed_sync_interval_seconds,
+    start_bank_feed_sync_thread,
+)
+from manager_mcp.client import ManagerClient
+from manager_mcp.http_auth import build_run_kwargs
+from manager_mcp.resources import all_resources, extract_items, form_path, resolve
+from manager_mcp.scopes import DOMAIN_SCOPES, WritePolicy
+from manager_mcp.writable import WRITABLE, implemented_for_scope
+from manager_mcp.write_validate import diff_persisted, validate_write_body
+
+_PERIOD_ALIASES = {
+    "from_date": "fromDate",
+    "to_date": "toDate",
+    "from": "fromDate",
+    "to": "toDate",
+}
+
+_ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.png"
+_ICON_HTTPS = (
+    "https://raw.githubusercontent.com/flumpiey/manager-mcp/main/docs/icon-512.png"
+)
+
+
+def server_icons() -> list[Icon]:
+    """Icons for initialize serverInfo (data URI + public HTTPS fallback)."""
+    icons: list[Icon] = []
+    if _ICON_PATH.is_file():
+        b64 = base64.standard_b64encode(_ICON_PATH.read_bytes()).decode("ascii")
+        icons.append(
+            Icon(
+                src=f"data:image/png;base64,{b64}",
+                mimeType="image/png",
+                sizes=["512x512"],
+            )
+        )
+    icons.append(Icon(src=_ICON_HTTPS, mimeType="image/png", sizes=["512x512"]))
+    return icons
+
+
+mcp = FastMCP(
+    "manager-mcp",
+    website_url="https://www.manager.io/",
+    icons=server_icons(),
+)
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health(_request: Request) -> Response:
+    return PlainTextResponse("ok")
+
+
+_client: ManagerClient | None = None
+_policy: WritePolicy | None = None
+_write_tools_registered = False
+_task_tools_registered = False
+
+_CRUD_EXEMPT_FROM_DEPRECATION = frozenset({"customer", "supplier"})
+
+
+def get_policy() -> WritePolicy:
+    global _policy
+    if _policy is None:
+        _policy = WritePolicy.from_env()
+    return _policy
+
+
+def get_client() -> ManagerClient:
+    global _client
+    if _client is None:
+        _client = ManagerClient.from_env(policy=get_policy())
+    return _client
+
+
+def reset_client() -> None:
+    """Test helper: drop cached client and policy."""
+    global _client, _policy, _write_tools_registered, _task_tools_registered
+    _client = None
+    _policy = None
+    _write_tools_registered = False
+    _task_tools_registered = False
+
+
+def _normalize_period(period: dict[str, Any], date_params: tuple[str, ...]) -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    for key, value in period.items():
+        if value is None or value == "":
+            continue
+        raw[_PERIOD_ALIASES.get(key, key)] = value
+    if not date_params:
+        return {}
+    return {key: raw[key] for key in date_params if key in raw}
+
+
+async def _fetch_report(name: str, **period: Any) -> dict[str, Any]:
+    desc = resolve(name)
+    if desc is None or desc.kind != "report":
+        raise ValueError(f"Unknown report '{name}'. Use list_resources.")
+    requested = {k: v for k, v in period.items() if v is not None and v != ""}
+    unsupported = bool(requested) and not desc.date_params
+    forward = _normalize_period(period, desc.date_params)
+    client = get_client()
+    client._extra_query_keys = frozenset(desc.date_params)
+    try:
+        body = await client.get(desc.path, params=forward or None)
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Manager HTTP {exc.response.status_code} for {name}") from exc
+    result: dict[str, Any] = {
+        "report": name,
+        "body": body,
+        "period_applied": bool(forward),
+    }
+    if unsupported:
+        result["period_unsupported_notice"] = (
+            "Date/period selection is not available for this view in v1; "
+            "returned current/default data."
+        )
+    return result
+
+
+@mcp.tool(
+    description=(
+        "List curated Manager.io capabilities. Default is read-only (10 tools). "
+        "Task tools register when write scopes match; CRUD tools are deprecated "
+        "unless raw scope is set."
+    )
+)
+async def list_resources() -> dict[str, Any]:
+    policy = get_policy()
+    resources = [
+        {
+            "name": r.name,
+            "kind": r.kind,
+            "description": r.description,
+            "path": r.path,
+        }
+        for r in all_resources()
+    ]
+    write_scopes = sorted(policy.write_scopes)
+    delete_scopes = sorted(policy.delete_scopes)
+    effective_write = sorted(policy.effective_write_scopes)
+    read_only = not (write_scopes or delete_scopes)
+    if read_only:
+        boundary = (
+            "Default is read-only: no task or CRUD write tools are registered. "
+            "Set MANAGER_MCP_WRITE_SCOPES / MANAGER_MCP_DELETE_SCOPES to enable mutations. "
+            "Recommended write scopes: banking,sales,parties."
+        )
+    else:
+        boundary = (
+            "Scoped writes enabled. Prefer task tools (issue_sales_invoice, "
+            "record_customer_payment, record_customer_deposit, …). "
+            "Per-resource CRUD is deprecated in 0.2.0 (removed in 0.3.0) unless "
+            "raw is in WRITE_SCOPES. write_scopes="
+            f"{write_scopes}; effective_write={effective_write}; "
+            f"delete_scopes={delete_scopes}. Verify writes with list_records/get_record."
+        )
+    return {
+        "resources": resources,
+        "read_only": read_only,
+        "write_scopes": write_scopes,
+        "delete_scopes": delete_scopes,
+        "effective_write_scopes": effective_write,
+        "boundary": boundary,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Search/page a curated collection. Core: customers, suppliers, sales_invoices, "
+        "purchase_invoices, chart_of_accounts, bank_accounts. Also writable domains "
+        "when present in discovery (e.g. receipts, payments, sales_quotes). "
+        "bank_accounts is the searchable collection; use bank_balances for snapshot balances."
+    )
+)
+async def list_records(
+    resource: str,
+    term: str | None = None,
+    sort_by: str | None = None,
+    sort_by_desc: bool | None = None,
+    skip: int = 0,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    desc = resolve(resource)
+    if desc is None or desc.kind != "collection":
+        raise ValueError(
+            f"Unknown collection '{resource}'. Use list_resources for supported names."
+        )
+    params: dict[str, Any] = {"skip": skip, "pageSize": page_size}
+    if term is not None:
+        params["term"] = term
+    if sort_by is not None:
+        params["sortBy"] = sort_by
+    if sort_by_desc is not None:
+        params["sortByDesc"] = sort_by_desc
+    client = get_client()
+    try:
+        body = await client.get(desc.path, params=params)
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
+    items = extract_items(desc, body)
+    total = body.get("totalRecords") if isinstance(body, dict) else None
+    if isinstance(total, int):
+        has_more = skip + len(items) < total
+    else:
+        has_more = len(items) >= page_size
+    return {
+        "resource": resource,
+        "items": items,
+        "skip": skip,
+        "page_size": page_size,
+        "term": term,
+        "truncated": has_more,
+        "has_more": has_more,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Fetch one collection record by GUID via Manager form endpoint "
+        "(e.g. /customer-form/{key}). chart_of_accounts has no single form. "
+        "For bank/cash account detail use resource=bank_accounts (not bank_balances)."
+    )
+)
+async def get_record(resource: str, key: str) -> dict[str, Any]:
+    path = form_path(resource, key)
+    if path is None:
+        raise ValueError(
+            f"Unknown collection '{resource}' or form fetch unsupported. Use list_resources."
+        )
+    client = get_client()
+    try:
+        body = await client.get(path)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise RuntimeError(f"Record not found: {resource}/{key}") from exc
+        raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
+    return {"resource": resource, "key": key, "body": body}
+
+
+@mcp.tool(
+    description=(
+        "Search text inside LINE ITEM descriptions (Lines[].LineDescription) — e.g. sales_invoices, "
+        "purchase_invoices, sales_quotes, purchase_quotes. list_records' `term` only matches "
+        "header-level fields (Reference, Customer/Supplier, the invoice's own Description); it "
+        "never sees text inside individual line items, so a search for text that only appears "
+        "on a line will come back empty there. Use this tool instead when the text might live "
+        "on a line. Pages the collection's headers, fetches each record's form, and returns "
+        "only records with at least one matching line (case-insensitive substring match). "
+        "Costs one extra Manager API call per header scanned, so page_size defaults small; "
+        "page with `skip` (see `has_more`) to cover a whole collection."
+    )
+)
+async def search_line_items(
+    resource: str,
+    term: str,
+    skip: int = 0,
+    page_size: int = 25,
+) -> dict[str, Any]:
+    desc = resolve(resource)
+    if desc is None or desc.kind != "collection" or not desc.supports_form:
+        raise ValueError(
+            f"Unknown collection '{resource}' or line-item search unsupported. "
+            "Use list_resources for supported names."
+        )
+    client = get_client()
+    try:
+        header_body = await client.get(desc.path, params={"skip": skip, "pageSize": page_size})
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
+    headers = extract_items(desc, header_body)
+    total = header_body.get("totalRecords") if isinstance(header_body, dict) else None
+    if isinstance(total, int):
+        has_more = skip + len(headers) < total
+    else:
+        has_more = len(headers) >= page_size
+
+    needle = term.lower()
+    matches: list[dict[str, Any]] = []
+    for item in headers:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")   # lowercase — matches the list-endpoint's field naming
+        if not key:
+            continue
+        path = form_path(resource, key)
+        if path is None:
+            continue
+        try:
+            form_body = await client.get(path)
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
+        lines = form_body.get("Lines") if isinstance(form_body, dict) else None
+        if not isinstance(lines, list):
+            continue
+        matched_lines = [
+            line.get("LineDescription")
+            for line in lines
+            if isinstance(line, dict)
+            and needle in str(line.get("LineDescription") or "").lower()
+        ]
+        if matched_lines:
+            matches.append(
+                {
+                    "Key": key,
+                    "Reference": item.get("Reference"),
+                    "Customer": item.get("Customer") or item.get("Supplier"),
+                    "matched_lines": matched_lines,
+                }
+            )
+    return {
+        "resource": resource,
+        "term": term,
+        "matches": matches,
+        "scanned": len(headers),
+        "skip": skip,
+        "page_size": page_size,
+        "has_more": has_more,
+    }
+
+
+@mcp.tool(description="Aged receivables / outstanding customer balances (read-only snapshot).")
+async def aged_receivables(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("aged_receivables", from_date=from_date, to_date=to_date)
+
+
+@mcp.tool(description="Aged payables snapshot (read-only).")
+async def aged_payables(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("aged_payables", from_date=from_date, to_date=to_date)
+
+
+@mcp.tool(
+    description=(
+        "Bank/cash balances snapshot (read-only). "
+        "For search/drill-in of individual accounts use list_records/get_record on bank_accounts."
+    )
+)
+async def bank_balances(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("bank_balances", from_date=from_date, to_date=to_date)
+
+
+@mcp.tool(description="Trial balance snapshot (read-only).")
+async def trial_balance(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("trial_balance", from_date=from_date, to_date=to_date)
+
+
+@mcp.tool(description="Profit and loss snapshot (read-only).")
+async def profit_and_loss(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("profit_and_loss", from_date=from_date, to_date=to_date)
+
+
+@mcp.tool(description="Balance sheet snapshot (read-only).")
+async def balance_sheet(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("balance_sheet", from_date=from_date, to_date=to_date)
+
+
+@mcp.tool(description="Tax summary snapshot (read-only).")
+async def tax_summary(
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    return await _fetch_report("tax_summary", from_date=from_date, to_date=to_date)
+
+
+async def _persist_and_verify(
+    resource_name: str,
+    fields: dict[str, Any],
+    body: Any,
+) -> dict[str, Any]:
+    w = WRITABLE[resource_name]
+    result: dict[str, Any] = {"resource": resource_name, "body": body, "warnings": []}
+    if not w.known_keys or not isinstance(body, dict):
+        return result
+    key = body.get("Key") or body.get("key")
+    if not key:
+        result["warnings"] = ["create/update response had no Key; could not verify"]
+        return result
+    persisted = await get_client().get(f"{w.form_path}/{key}")
+    form = persisted if isinstance(persisted, dict) else None
+    result["warnings"] = diff_persisted(w, fields, form)
+    result["verified"] = persisted
+    return result
+
+
+def _make_create_tool(resource_name: str) -> Any:
+    w = WRITABLE[resource_name]
+    stem = w.tool_stem
+
+    async def _create(fields: dict[str, Any]) -> dict[str, Any]:
+        validate_write_body(w, fields, creating=True)
+        body = await get_client().post(w.form_path, json=fields)
+        if w.known_keys:
+            return await _persist_and_verify(resource_name, fields, body)
+        return {"resource": resource_name, "body": body}
+
+    _create.__name__ = f"create_{stem}"
+    notes = f" {w.create_notes}" if w.create_notes else ""
+    _create.__doc__ = (
+        f"Create a {stem.replace('_', ' ')} via POST {w.form_path}. "
+        f"Requires {w.scope!r} in MANAGER_MCP_WRITE_SCOPES.{notes}"
+    )
+    return _create
+
+
+def _make_update_tool(resource_name: str) -> Any:
+    w = WRITABLE[resource_name]
+    stem = w.tool_stem
+
+    async def _update(key: str, fields: dict[str, Any]) -> dict[str, Any]:
+        validate_write_body(w, fields, creating=False)
+        path = f"{w.form_path}/{key}"
+        body = await get_client().put(path, json=fields)
+        if w.known_keys:
+            out = await _persist_and_verify(resource_name, fields, body or {"Key": key})
+            out["key"] = key
+            return out
+        return {"resource": resource_name, "key": key, "body": body}
+
+    _update.__name__ = f"update_{stem}"
+    _update.__doc__ = (
+        f"Update a {stem.replace('_', ' ')} via PUT {w.form_path}/{{key}}. "
+        f"Requires {w.scope!r} in MANAGER_MCP_WRITE_SCOPES. "
+        "Prefer GET form → modify → PUT (full document replace)."
+    )
+    return _update
+
+
+def _make_delete_tool(resource_name: str) -> Any:
+    w = WRITABLE[resource_name]
+    stem = w.tool_stem
+
+    async def _delete(key: str) -> dict[str, Any]:
+        path = f"{w.form_path}/{key}"
+        body = await get_client().delete(path)
+        return {"resource": resource_name, "key": key, "body": body}
+
+    _delete.__name__ = f"delete_{stem}"
+    _delete.__doc__ = (
+        f"Delete a {stem.replace('_', ' ')} via DELETE {w.form_path}/{{key}}. "
+        f"Requires {w.scope!r} in MANAGER_MCP_DELETE_SCOPES "
+        "(write scope alone is not enough)."
+    )
+    return _delete
+
+
+_WRITE_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+_DELETE_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+
+
+def _deprecation_prefix(policy: WritePolicy, stem: str) -> str:
+    if "raw" in policy.write_scopes:
+        return ""
+    if stem in _CRUD_EXEMPT_FROM_DEPRECATION:
+        return ""
+    return "[DEPRECATED in 0.2.0; use task tools] "
+
+
+def _scopes_for_registration(policy: WritePolicy) -> set[str]:
+    if "raw" in policy.write_scopes or "raw" in policy.delete_scopes:
+        return set(DOMAIN_SCOPES)
+    return set(policy.write_scopes | policy.delete_scopes) - {"raw"}
+
+
+def register_write_tools() -> None:
+    """Validate scope env and register create_*/update_*/delete_* for implemented scopes."""
+    global _write_tools_registered
+    if _write_tools_registered:
+        return
+    policy = get_policy()
+
+    def prefix_fn(stem: str) -> str:
+        return _deprecation_prefix(policy, stem)
+
+    for scope in sorted(_scopes_for_registration(policy)):
+        for w in implemented_for_scope(scope):
+            stem = w.tool_stem
+            dep = prefix_fn(stem)
+            if w.scope in policy.effective_write_scopes:
+                create_fn = _make_create_tool(w.name)
+                update_fn = _make_update_tool(w.name)
+                mcp.tool(
+                    name=f"create_{stem}",
+                    description=dep + (create_fn.__doc__ or ""),
+                    annotations=_WRITE_ANNOTATIONS,
+                )(create_fn)
+                mcp.tool(
+                    name=f"update_{stem}",
+                    description=dep + (update_fn.__doc__ or ""),
+                    annotations=_WRITE_ANNOTATIONS,
+                )(update_fn)
+            if w.scope in policy.effective_delete_scopes:
+                delete_fn = _make_delete_tool(w.name)
+                mcp.tool(
+                    name=f"delete_{stem}",
+                    description=dep + (delete_fn.__doc__ or ""),
+                    annotations=_DELETE_ANNOTATIONS,
+                )(delete_fn)
+    _write_tools_registered = True
+
+
+def register_task_tools() -> None:
+    """Register intent-shaped task tools when required write scopes are active."""
+    global _task_tools_registered
+    if _task_tools_registered:
+        return
+    policy = get_policy()
+    effective = policy.effective_write_scopes
+
+    if "sales" in effective:
+
+        @mcp.tool(
+            name="issue_sales_invoice",
+            description=(
+                "Issue a sales invoice with inline line items. Requires sales scope. "
+                "Body is Manager-native JSON (clone get_record template)."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def issue_sales_invoice(fields: dict[str, Any]) -> dict[str, Any]:
+            return await _tt.issue_sales_invoice(get_client(), get_policy(), fields)
+
+    if "purchases" in effective:
+
+        @mcp.tool(
+            name="issue_purchase_invoice",
+            description=(
+                "Issue a purchase invoice. Requires purchases scope. "
+                "Body is Manager-native JSON."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def issue_purchase_invoice(fields: dict[str, Any]) -> dict[str, Any]:
+            return await _tt.issue_purchase_invoice(get_client(), get_policy(), fields)
+
+        @mcp.tool(
+            name="attach_receipt_to_purchase_invoice",
+            description=(
+                "Attach a receipt image/PDF to a purchase invoice. Routed "
+                "by file type: images (jpeg/png) go to the legacy Image "
+                "field (Edit page); anything else (e.g. PDF) goes to "
+                "Manager's Attachments list (paperclip icon / View page) "
+                "instead. Requires purchases scope. /api2 has no "
+                "documented attachment endpoint, so this uses Manager's "
+                "undocumented action endpoints directly (no browser). May "
+                "fail if an unsupported endpoint has changed. "
+                "Pass exactly one source: file_path (readable on this machine), "
+                "file_content_base64 + file_name (raw bytes a caller already has "
+                "in memory), or file_url (any plain HTTP(S) URL this server "
+                "fetches directly — e.g. a short-lived signed link from a caller "
+                "with no filesystem to stage a file on). "
+                "search_term defaults to the invoice's own Description — pass it "
+                "explicitly if that isn't specific enough to find the invoice."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def attach_receipt_to_purchase_invoice(
+            invoice_key: str,
+            file_path: str | None = None,
+            file_content_base64: str | None = None,
+            file_name: str | None = None,
+            file_url: str | None = None,
+            search_term: str | None = None,
+        ) -> dict[str, Any]:
+            return await _tt.attach_receipt_to_purchase_invoice(
+                get_client(),
+                get_policy(),
+                invoice_key,
+                file_path,
+                file_content_base64,
+                file_name,
+                file_url,
+                search_term,
+            )
+
+    if "quotes" in effective:
+
+        @mcp.tool(
+            name="issue_quote",
+            description=(
+                "Issue a sales or purchase quote. Requires quotes scope. "
+                "Set purchase=true for purchase quotes."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def issue_quote(
+            fields: dict[str, Any],
+            purchase: bool = False,
+        ) -> dict[str, Any]:
+            return await _tt.issue_quote(get_client(), get_policy(), fields, purchase=purchase)
+
+        @mcp.tool(
+            name="issue_deposit_invoice",
+            description=(
+                "Issue a sales quote styled as a deposit invoice (not revenue). "
+                "Requires quotes scope. Confirm tax treatment with accountant."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def issue_deposit_invoice(fields: dict[str, Any]) -> dict[str, Any]:
+            return await _tt.issue_deposit_invoice(get_client(), get_policy(), fields)
+
+    if "quotes" in effective and "sales" in effective:
+
+        @mcp.tool(
+            name="convert_quote_to_invoice",
+            description=(
+                "Convert a sales quote to a sales invoice. Requires quotes and sales scopes."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def convert_quote_to_invoice(
+            quote_key: str,
+            extra_fields: dict[str, Any] | None = None,
+            purchase: bool = False,
+        ) -> dict[str, Any]:
+            return await _tt.convert_quote_to_invoice(
+                get_client(),
+                get_policy(),
+                quote_key,
+                purchase=purchase,
+                extra_fields=extra_fields,
+            )
+
+    if "banking" in effective:
+
+        @mcp.tool(
+            name="record_customer_payment",
+            description=(
+                "Record a customer receipt and allocate it to an open sales invoice. "
+                "Requires banking scope. Atomic: receipt + allocation."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def record_customer_payment(
+            customer: str,
+            bank_account: str,
+            date: str,
+            amount: float,
+            invoice_key: str,
+            reference: str | None = None,
+            paid_by: int = 1,
+            description: str | None = None,
+        ) -> dict[str, Any]:
+            return await _tt.record_customer_payment(
+                get_client(),
+                get_policy(),
+                customer=customer,
+                bank_account=bank_account,
+                date=date,
+                amount=amount,
+                invoice_key=invoice_key,
+                reference=reference,
+                paid_by=paid_by,
+                description=description,
+            )
+
+        @mcp.tool(
+            name="record_supplier_payment",
+            description=(
+                "Record a supplier payment allocated to a purchase invoice. "
+                "Requires banking scope."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def record_supplier_payment(
+            supplier: str,
+            bank_account: str,
+            date: str,
+            amount: float,
+            invoice_key: str,
+            reference: str | None = None,
+            paid_by: int = 1,
+            description: str | None = None,
+        ) -> dict[str, Any]:
+            return await _tt.record_supplier_payment(
+                get_client(),
+                get_policy(),
+                supplier=supplier,
+                bank_account=bank_account,
+                date=date,
+                amount=amount,
+                invoice_key=invoice_key,
+                reference=reference,
+                paid_by=paid_by,
+                description=description,
+            )
+
+        @mcp.tool(
+            name="record_customer_deposit",
+            description=(
+                "Record money received before an invoice exists (not revenue). "
+                "Requires banking scope and a deposit bank/cash account. "
+                "Returns precondition_failed with setup steps if the account is missing."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def record_customer_deposit(
+            customer: str,
+            amount: float,
+            date: str,
+            bank_account: str | None = None,
+            reference: str | None = None,
+            paid_by: int = 1,
+            description: str | None = None,
+        ) -> dict[str, Any]:
+            return await _tt.record_customer_deposit(
+                get_client(),
+                get_policy(),
+                customer=customer,
+                amount=amount,
+                date=date,
+                bank_account=bank_account,
+                reference=reference,
+                paid_by=paid_by,
+                description=description,
+            )
+
+        @mcp.tool(
+            name="transfer_between_accounts",
+            description="Transfer between bank/cash accounts. Requires banking scope.",
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def transfer_between_accounts(fields: dict[str, Any]) -> dict[str, Any]:
+            return await _tt.transfer_between_accounts(get_client(), get_policy(), fields)
+
+    if "payroll" in effective or "purchases" in effective:
+
+        @mcp.tool(
+            name="record_expense",
+            description=(
+                "Record an expense via expense_claim (payroll) or purchase_invoice "
+                "(purchases). Requires payroll and/or purchases scope."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def record_expense(
+            fields: dict[str, Any],
+            via: str = "auto",
+        ) -> dict[str, Any]:
+            return await _tt.record_expense(
+                get_client(), get_policy(), fields, via=via
+            )
+
+    if "ledger" in effective:
+
+        @mcp.tool(
+            name="post_journal_entry",
+            description="Post a generic journal entry. Requires ledger scope.",
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def post_journal_entry(fields: dict[str, Any]) -> dict[str, Any]:
+            return await _tt.post_journal_entry(get_client(), get_policy(), fields)
+
+        @mcp.tool(
+            name="apply_deposit_to_invoice",
+            description=(
+                "Apply held customer deposit to a sales invoice via journal entry. "
+                "Requires ledger scope. Clone get_record on journal_entries. "
+                "Deposits are not revenue."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def apply_deposit_to_invoice(fields: dict[str, Any]) -> dict[str, Any]:
+            return await _tt.apply_deposit_to_invoice(get_client(), get_policy(), fields)
+
+    if policy.effective_delete_scopes:
+
+        @mcp.tool(
+            name="void_document",
+            description=(
+                "Void (delete) a document by resource name and key. "
+                "Requires matching DELETE scope (e.g. sales for sales_invoices)."
+            ),
+            annotations=_DELETE_ANNOTATIONS,
+        )
+        async def void_document(resource: str, key: str) -> dict[str, Any]:
+            return await _tt.void_document(get_client(), get_policy(), resource, key)
+
+    _task_tools_registered = True
+
+
+def main() -> None:
+    # Not configured elsewhere — needed so manager_mcp.attachments_api's
+    # request/response logging (and anything else using `logging`) actually
+    # reaches stdout/stderr, i.e. `docker compose logs manager-mcp`.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    register_task_tools()
+    register_write_tools()
+    interval = bank_feed_sync_interval_seconds()
+    if interval is not None:
+        start_bank_feed_sync_thread(interval)
+    run_kwargs = build_run_kwargs()
+    mcp.auth = run_kwargs.pop("auth", None)
+    mcp.run(**run_kwargs)
+
+
+if __name__ == "__main__":
+    main()
