@@ -160,7 +160,15 @@ async def _fetch_basiq_transactions(access_token: str, basiq_account_id: str) ->
             f"Basiq transactions fetch failed: HTTP {resp.status_code}: {resp.text[:500]}"
         )
     data = resp.json().get("data", [])
-    return [t for t in data if t.get("status") == "posted"]
+    posted = [t for t in data if t.get("status") == "posted"]
+    _log.info(
+        "Aussie Bank Feeds fetch account=%s total=%d posted=%d pending=%d",
+        basiq_account_id,
+        len(data),
+        len(posted),
+        len(data) - len(posted),
+    )
+    return posted
 
 
 # Basiq/Manager mask account numbers in transaction descriptions inconsistently
@@ -266,11 +274,25 @@ async def _sync_one_account(
     seen_ids, seen_fuzzy, latest_date = await _existing_dedup_keys(client, bank_account_key)
 
     start_date = _sync_start_date(latest_date)
+    before_start_date_filter = len(txns)
     if start_date is not None:
         txns = [t for t in txns if _local_date(t["postDate"]) >= start_date]
+    _log.info(
+        "Aussie Bank Feeds sync account=%s latest_existing_date=%s start_date=%s "
+        "posted_fetched=%d in_window=%d excluded_by_lookback=%d",
+        bank_account_key,
+        latest_date,
+        start_date,
+        before_start_date_filter,
+        len(txns),
+        before_start_date_filter - len(txns),
+    )
+
+    skip_reason: dict[str, str] = {}
 
     def _is_new(txn: dict) -> bool:
         if txn["id"] in seen_ids:
+            skip_reason[txn["id"]] = "dedup_id"
             return False
         entity = "receipt-batch" if float(txn["amount"]) > 0 else "payment-batch"
         key = (
@@ -278,9 +300,22 @@ async def _sync_one_account(
             round(abs(float(txn["amount"])), 2),
             _normalize_description(txn["description"]),
         )
-        return key not in seen_fuzzy[entity]
+        if key in seen_fuzzy[entity]:
+            skip_reason[txn["id"]] = "fuzzy_match"
+            return False
+        return True
 
     new = [t for t in txns if _is_new(t)]
+    for txn in txns:
+        if txn["id"] in skip_reason:
+            _log.info(
+                "Aussie Bank Feeds skip account=%s id=%s date=%s amount=%s reason=%s",
+                bank_account_key,
+                txn["id"],
+                _local_date(txn["postDate"]),
+                txn["amount"],
+                skip_reason[txn["id"]],
+            )
     credits = [
         _build_line(bank_account_key, "receivedIn", t) for t in new if float(t["amount"]) > 0
     ]
@@ -311,6 +346,13 @@ async def _sync_one_account(
                 f"/api4/payment-batch write failed: HTTP {resp.status_code}: {resp.text[:500]}"
             )
         written["payments"] = len(debits)
+    _log.info(
+        "Aussie Bank Feeds sync account=%s new=%d written_receipts=%d written_payments=%d",
+        bank_account_key,
+        len(new),
+        written["receipts"],
+        written["payments"],
+    )
     return {"bank_account": bank_account_key, "fetched": len(txns), "new": len(new), **written}
 
 
@@ -625,9 +667,11 @@ async def run_bank_feed_sync_loop(
         await nap(startup_delay)
     while True:
         try:
-            await sync()
+            result = await sync()
         except Exception:
             _log.exception("bank-feed sync failed")
+        else:
+            _log.info("bank-feed sync result: %s", result)
         await nap(interval)
 
 
