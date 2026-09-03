@@ -57,6 +57,23 @@ from manager_mcp.client import ConfigError, ManagerClient
 
 _log = logging.getLogger(__name__)
 
+
+class _SuppressDedupPaginationLogs(logging.Filter):
+    """Drop httpx's per-request INFO log for the /api4 dedup-key pagination
+    GETs in `_existing_dedup_keys` -- dozens per sync as accounts grow, and
+    already summarized by our own fetch/result log lines. The POST calls
+    that actually write new receipts/payments use the same paths, so only
+    GET is filtered -- writes should stay visible."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "GET" not in msg:
+            return True
+        return "/api4/receipt-batch" not in msg and "/api4/payment-batch" not in msg
+
+
+logging.getLogger("httpx").addFilter(_SuppressDedupPaginationLogs())
+
 INTERVAL_ENV = "MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS"
 SYNC_PATH = "/check-for-new-transactions"
 TAB_PATH = "/bank-and-cash-accounts"
@@ -277,7 +294,7 @@ async def _sync_one_account(
     before_start_date_filter = len(txns)
     if start_date is not None:
         txns = [t for t in txns if _local_date(t["postDate"]) >= start_date]
-    _log.info(
+    _log.debug(
         "Aussie Bank Feeds sync account=%s latest_existing_date=%s start_date=%s "
         "posted_fetched=%d in_window=%d excluded_by_lookback=%d",
         bank_account_key,
@@ -308,7 +325,7 @@ async def _sync_one_account(
     new = [t for t in txns if _is_new(t)]
     for txn in txns:
         if txn["id"] in skip_reason:
-            _log.info(
+            _log.debug(
                 "Aussie Bank Feeds skip account=%s id=%s date=%s amount=%s reason=%s",
                 bank_account_key,
                 txn["id"],
@@ -346,7 +363,7 @@ async def _sync_one_account(
                 f"/api4/payment-batch write failed: HTTP {resp.status_code}: {resp.text[:500]}"
             )
         written["payments"] = len(debits)
-    _log.info(
+    _log.debug(
         "Aussie Bank Feeds sync account=%s new=%d written_receipts=%d written_payments=%d",
         bank_account_key,
         len(new),
