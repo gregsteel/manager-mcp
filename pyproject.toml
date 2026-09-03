@@ -29,6 +29,9 @@ classifiers = [
 dependencies = [
   "fastmcp>=2.0",
   "httpx",
+  # zoneinfo (bank_feeds.py) needs tzdata files; python:3.12-slim doesn't
+  # ship the OS tzdata package, so bundle Python's own copy.
+  "tzdata",
 ]
 
 [project.urls]

@@ -3,6 +3,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# tzdata gives glibc's localtime() (and hence `%(asctime)s` in logs) access
+# to named zones via the TZ env var; python:3.12-slim doesn't include it.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock README.md LICENSE ./

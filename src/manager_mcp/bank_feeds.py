@@ -45,10 +45,11 @@ import re
 import threading
 from base64 import urlsafe_b64encode
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import unescape
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -95,6 +96,24 @@ BANK_ACCOUNT_LINKS: dict[str, str] = {
 }
 
 MANAGER_BUSINESS = "Lilith Pty Ltd"
+
+# Basiq's `postDate` is UTC. Manager transaction dates need the business's
+# own calendar date, not UTC's -- naively truncating the ISO string
+# (`postDate[:10]`) dated transactions a day early whenever they posted
+# after ~2pm UTC (local midnight in Melbourne, UTC+10/+11), confirmed live
+# 2026-09-03 by comparing Manager's imported dates against the real bank
+# statement (a 01/09 transaction landed in Manager as 31/8).
+MANAGER_BUSINESS_TZ = ZoneInfo("Australia/Melbourne")
+
+
+def _local_date(iso_timestamp: str) -> str:
+    """Basiq `postDate` (UTC ISO 8601) -> the business's local calendar date."""
+    return (
+        datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+        .astimezone(MANAGER_BUSINESS_TZ)
+        .date()
+        .isoformat()
+    )
 
 
 class AussieBankFeedsSyncError(RuntimeError):
@@ -229,7 +248,7 @@ def _build_line(bank_account_key: str, direction_field: str, txn: dict) -> dict:
     """Shape matches a live captured POST body exactly."""
     amount = abs(float(txn["amount"]))
     return {
-        "date": txn["postDate"][:10],
+        "date": _local_date(txn["postDate"]),
         "reference": "",
         "description": txn["description"],
         direction_field: bank_account_key,
@@ -248,14 +267,14 @@ async def _sync_one_account(
 
     start_date = _sync_start_date(latest_date)
     if start_date is not None:
-        txns = [t for t in txns if t["postDate"][:10] >= start_date]
+        txns = [t for t in txns if _local_date(t["postDate"]) >= start_date]
 
     def _is_new(txn: dict) -> bool:
         if txn["id"] in seen_ids:
             return False
         entity = "receipt-batch" if float(txn["amount"]) > 0 else "payment-batch"
         key = (
-            txn["postDate"][:10],
+            _local_date(txn["postDate"]),
             round(abs(float(txn["amount"])), 2),
             _normalize_description(txn["description"]),
         )
