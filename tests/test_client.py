@@ -145,3 +145,33 @@ async def test_get_filters_query_params() -> None:
     assert route.calls.last.request.url.params.get("term") == "x"
     assert "inject" not in route.calls.last.request.url.params
     await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_raw_basic_sends_authorization_not_api_key() -> None:
+    url = "http://example.test/api/bank-and-cash-accounts/check-for-new-transactions"
+    route = respx.post(url).mock(return_value=httpx.Response(200, text="ok"))
+    client = ManagerClient(
+        "http://example.test/api2",
+        "super-secret",
+        ui_username="mcp",
+        ui_password="secret",
+    )
+    response = await client.raw_basic(
+        "POST", url, headers={"HX-Request": "true"}
+    )
+    assert response.status_code == 200
+    request = route.calls.last.request
+    assert request.headers.get("Authorization", "").startswith("Basic ")
+    assert request.headers.get("HX-Request") == "true"
+    assert "x-api-key" not in {k.lower() for k in request.headers}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_raw_basic_requires_ui_credentials() -> None:
+    client = ManagerClient("http://example.test/api2", "k")
+    with pytest.raises(ConfigError, match="MANAGER_UI_USERNAME"):
+        await client.raw_basic("POST", "http://example.test/api/x")
+    await client.aclose()

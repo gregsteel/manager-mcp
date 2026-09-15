@@ -109,8 +109,25 @@ Do not book the deposit to a revenue account as a workaround.
 
 ## Read tools
 
-- `list_resources`, `list_records`, `get_record`
+- `list_resources`, `list_records`, `get_record`, `search_line_items`
 - Reports: `aged_receivables`, `aged_payables`, `bank_balances`,
   `trial_balance`, `profit_and_loss`, `balance_sheet`, `tax_summary`
 
 `bank_balances` (snapshot) and `bank_accounts` (collection) are both intentional.
+
+## Searching for text in a description
+
+Manager.io invoices, quotes, etc. have **two different "description" fields**:
+
+- The **header Description** (one per document) — this is what `list_records`'
+  `term` searches, along with Reference and Customer/Supplier.
+- Each **line item's own Description** (`Lines[].Description`) — `term` does
+  **not** search this. A document whose only match is on a line will not show
+  up in `list_records` results at all.
+
+If a `list_records` search for a string comes back empty (or the user says
+the text is "in the line items" / "in the invoice lines"), do **not** report
+"not found" — retry with `search_line_items` (same `resource`, same `term`),
+which pages the collection and checks every line. It costs one extra API call
+per record scanned, so it defaults to a small `page_size`; use `skip` and
+`has_more` to keep paging if the first page doesn't find it.

@@ -1,17 +1,28 @@
-"""FastMCP Manager.io server (stdio via `manager-mcp`). Writes via scope envs."""
+"""FastMCP Manager.io server. Stdio by default; MANAGER_MCP_TRANSPORT=http for
+remote Streamable HTTP + Google OAuth (see http_auth.py). Writes via scope envs."""
 
 from __future__ import annotations
 
 import base64
+import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
 from mcp.types import Icon
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
 
+from manager_mcp import setup_ui
 from manager_mcp import task_tools as _tt
+from manager_mcp.bank_feeds import (
+    bank_feed_sync_interval_seconds,
+    start_bank_feed_sync_thread,
+    sync_or_report,
+)
 from manager_mcp.client import ManagerClient
+from manager_mcp.http_auth import build_run_kwargs
 from manager_mcp.resources import all_resources, extract_items, form_path, resolve
 from manager_mcp.scopes import DOMAIN_SCOPES, WritePolicy
 from manager_mcp.writable import WRITABLE, implemented_for_scope
@@ -51,6 +62,30 @@ mcp = FastMCP(
     website_url="https://www.manager.io/",
     icons=server_icons(),
 )
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health(_request: Request) -> Response:
+    return PlainTextResponse("ok")
+
+
+# Bank-feed setup UI (only reachable at all under MANAGER_MCP_TRANSPORT=http;
+# see setup_ui.py). Gated by the same Google OAuth client/allowlist as the
+# MCP endpoint itself, not by FastMCP's own auth middleware -- registering
+# it here just wires the routes, `setup_ui._require_session` does the check.
+mcp.custom_route(setup_ui.LOGIN_PATH, methods=["GET"], include_in_schema=False)(setup_ui.login)
+mcp.custom_route(setup_ui.CALLBACK_PATH, methods=["GET"], include_in_schema=False)(
+    setup_ui.callback
+)
+mcp.custom_route(setup_ui.PAGE_PATH, methods=["GET"], include_in_schema=False)(
+    setup_ui.bank_feeds_page
+)
+mcp.custom_route(setup_ui.PAGE_PATH, methods=["POST"], include_in_schema=False)(setup_ui.submit)
+mcp.custom_route(setup_ui.DETECT_BASIQ_PATH, methods=["POST"], include_in_schema=False)(
+    setup_ui.detect_basiq
+)
+
+
 _client: ManagerClient | None = None
 _policy: WritePolicy | None = None
 _write_tools_registered = False
@@ -237,6 +272,87 @@ async def get_record(resource: str, key: str) -> dict[str, Any]:
             raise RuntimeError(f"Record not found: {resource}/{key}") from exc
         raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
     return {"resource": resource, "key": key, "body": body}
+
+
+@mcp.tool(
+    description=(
+        "Search text inside LINE ITEM descriptions (Lines[].LineDescription) — e.g. sales_invoices, "
+        "purchase_invoices, sales_quotes, purchase_quotes. list_records' `term` only matches "
+        "header-level fields (Reference, Customer/Supplier, the invoice's own Description); it "
+        "never sees text inside individual line items, so a search for text that only appears "
+        "on a line will come back empty there. Use this tool instead when the text might live "
+        "on a line. Pages the collection's headers, fetches each record's form, and returns "
+        "only records with at least one matching line (case-insensitive substring match). "
+        "Costs one extra Manager API call per header scanned, so page_size defaults small; "
+        "page with `skip` (see `has_more`) to cover a whole collection."
+    )
+)
+async def search_line_items(
+    resource: str,
+    term: str,
+    skip: int = 0,
+    page_size: int = 25,
+) -> dict[str, Any]:
+    desc = resolve(resource)
+    if desc is None or desc.kind != "collection" or not desc.supports_form:
+        raise ValueError(
+            f"Unknown collection '{resource}' or line-item search unsupported. "
+            "Use list_resources for supported names."
+        )
+    client = get_client()
+    try:
+        header_body = await client.get(desc.path, params={"skip": skip, "pageSize": page_size})
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
+    headers = extract_items(desc, header_body)
+    total = header_body.get("totalRecords") if isinstance(header_body, dict) else None
+    if isinstance(total, int):
+        has_more = skip + len(headers) < total
+    else:
+        has_more = len(headers) >= page_size
+
+    needle = term.lower()
+    matches: list[dict[str, Any]] = []
+    for item in headers:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")   # lowercase — matches the list-endpoint's field naming
+        if not key:
+            continue
+        path = form_path(resource, key)
+        if path is None:
+            continue
+        try:
+            form_body = await client.get(path)
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(f"Manager HTTP {exc.response.status_code}") from exc
+        lines = form_body.get("Lines") if isinstance(form_body, dict) else None
+        if not isinstance(lines, list):
+            continue
+        matched_lines = [
+            line.get("LineDescription")
+            for line in lines
+            if isinstance(line, dict)
+            and needle in str(line.get("LineDescription") or "").lower()
+        ]
+        if matched_lines:
+            matches.append(
+                {
+                    "Key": key,
+                    "Reference": item.get("Reference"),
+                    "Customer": item.get("Customer") or item.get("Supplier"),
+                    "matched_lines": matched_lines,
+                }
+            )
+    return {
+        "resource": resource,
+        "term": term,
+        "matches": matches,
+        "scanned": len(headers),
+        "skip": skip,
+        "page_size": page_size,
+        "has_more": has_more,
+    }
 
 
 @mcp.tool(description="Aged receivables / outstanding customer balances (read-only snapshot).")
@@ -480,6 +596,46 @@ def register_task_tools() -> None:
         async def issue_purchase_invoice(fields: dict[str, Any]) -> dict[str, Any]:
             return await _tt.issue_purchase_invoice(get_client(), get_policy(), fields)
 
+        @mcp.tool(
+            name="attach_receipt_to_purchase_invoice",
+            description=(
+                "Attach a receipt image/PDF to a purchase invoice. Routed "
+                "by file type: images (jpeg/png) go to the legacy Image "
+                "field (Edit page); anything else (e.g. PDF) goes to "
+                "Manager's Attachments list (paperclip icon / View page) "
+                "instead. Requires purchases scope. /api2 has no "
+                "documented attachment endpoint, so this uses Manager's "
+                "undocumented action endpoints directly (no browser). May "
+                "fail if an unsupported endpoint has changed. "
+                "Pass exactly one source: file_path (readable on this machine), "
+                "file_content_base64 + file_name (raw bytes a caller already has "
+                "in memory), or file_url (any plain HTTP(S) URL this server "
+                "fetches directly — e.g. a short-lived signed link from a caller "
+                "with no filesystem to stage a file on). "
+                "search_term defaults to the invoice's own Description — pass it "
+                "explicitly if that isn't specific enough to find the invoice."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def attach_receipt_to_purchase_invoice(
+            invoice_key: str,
+            file_path: str | None = None,
+            file_content_base64: str | None = None,
+            file_name: str | None = None,
+            file_url: str | None = None,
+            search_term: str | None = None,
+        ) -> dict[str, Any]:
+            return await _tt.attach_receipt_to_purchase_invoice(
+                get_client(),
+                get_policy(),
+                invoice_key,
+                file_path,
+                file_content_base64,
+                file_name,
+                file_url,
+                search_term,
+            )
+
     if "quotes" in effective:
 
         @mcp.tool(
@@ -530,6 +686,21 @@ def register_task_tools() -> None:
             )
 
     if "banking" in effective:
+
+        @mcp.tool(
+            name="sync_bank_feeds",
+            description=(
+                "Trigger a bank-feed import right now, via whichever provider is configured "
+                "(see MANAGER_MCP_BANK_FEED_PROVIDER) -- the same sync that otherwise only runs "
+                "on the MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS timer. Requires banking scope. "
+                "If no provider is configured yet, this returns configured=false with a setup_url "
+                "instead of an error -- tell the user to open that page (it detects what it can "
+                "from Manager and only asks for what it can't, e.g. an Aussie Bank Feeds login)."
+            ),
+            annotations=_WRITE_ANNOTATIONS,
+        )
+        async def sync_bank_feeds() -> dict[str, Any]:
+            return await sync_or_report(get_client(), setup_url=setup_ui.setup_url())
 
         @mcp.tool(
             name="record_customer_payment",
@@ -688,9 +859,18 @@ def register_task_tools() -> None:
 
 
 def main() -> None:
+    # Not configured elsewhere — needed so manager_mcp.attachments_api's
+    # request/response logging (and anything else using `logging`) actually
+    # reaches stdout/stderr, i.e. `docker compose logs manager-mcp`.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     register_task_tools()
     register_write_tools()
-    mcp.run()
+    interval = bank_feed_sync_interval_seconds()
+    if interval is not None:
+        start_bank_feed_sync_thread(interval, setup_url=setup_ui.setup_url())
+    run_kwargs = build_run_kwargs()
+    mcp.auth = run_kwargs.pop("auth", None)
+    mcp.run(**run_kwargs)
 
 
 if __name__ == "__main__":

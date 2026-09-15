@@ -2,6 +2,59 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Hourly bank-feed sync: when `MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS`
+  is set (compose uses 3600), run whichever bank-feed provider is configured
+  as the mcp user. Unset or 0 leaves the loop off.
+
+- Pluggable bank-feed providers (`src/manager_mcp/bank_feed_providers/`):
+  a `BankFeedProvider` interface (`is_configured`, `sync`, optional
+  `setup_state`) with `basiq` (Aussie Bank Feeds) built in, now configured
+  via `MANAGER_MCP_BASIQ_ACCOUNT_LINKS` / `_DEDUP_FIELD` / `_TIMEZONE`
+  instead of hardcoded account links and a hardcoded business name.
+  `MANAGER_MCP_BANK_FEED_PROVIDER` selects a provider explicitly; unset,
+  the first configured provider wins. The setup UI's provider picker has
+  an "Other…" entry with instructions for adding a new one.
+
+- Removed the built-in "Check for New Transactions" fallback provider (GET
+  `/check-for-new-transactions` as the mcp user). It only ever worked
+  against older Manager installs that predate the Aussie Bank Feeds
+  extension; every deployment this runs against already has that
+  extension, so the fallback never actually imported anything.
+
+- Bank-feed provider config now lives in its own file
+  (`bank_feed_providers/feeds_config.py`, default
+  `/secrets/manager/feeds.config`, path overridable via
+  `MANAGER_MCP_BANK_FEED_CONFIG_PATH`) instead of `secrets/manager-mcp.env`.
+  `feeds_config.effective_environ()` overlays it on `os.environ`, read
+  fresh on every provider call, so a saved change takes effect on the next
+  scheduled sync or `sync_bank_feeds` call with no restart. Compose mounts
+  `./secrets/manager` read-write into manager-mcp for this; it's
+  `.gitignore`'d.
+
+- Browser setup UI at `/setup/bank-feeds` (`MANAGER_MCP_TRANSPORT=http`
+  only), gated by the same Google OAuth client/allowlist as the MCP
+  transport (needs `{MANAGER_MCP_OAUTH_BASE_URL}/setup/callback` added to
+  the OAuth client's redirect URIs). Detects Manager bank accounts,
+  business name, and custom fields already in use from `/api2`/`/api4`;
+  only prompts for what a provider can't read from Manager (and, given a
+  Basiq login, live-detects its accounts too). Saves straight to the
+  config file above; never writes to Manager or to `manager-mcp.env`.
+
+- `sync_bank_feeds` MCP tool (banking scope): triggers a sync immediately
+  instead of waiting for the timer. Returns `{"configured": false,
+  "setup_url": ..., "hint": ...}` rather than raising when nothing is
+  configured yet, so an agent can point the user at the setup UI.
+
+- `search_line_items` tool: searches text inside line-item descriptions
+  (`Lines[].Description`) for sales_invoices, purchase_invoices, and other
+  form-backed collections. `list_records`' `term` only matches header fields
+  (Reference, Customer/Supplier, header Description) and misses text that
+  only appears on a line.
+
 ## [0.2.6] - 2026-08-03
 
 ### Fixed

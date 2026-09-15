@@ -8,6 +8,8 @@
 
 <!-- mcp-name: io.github.flumpiey/manager-mcp -->
 
+> This repository is a fork of the upstream [flumpiey/manager-mcp](https://github.com/flumpiey/manager-mcp) project. The work on this branch adds Manager.io MCP support for remote HTTP hosting, OAuth-backed access, and file attachment workflows beyond the upstream stdio-first implementation.
+
 **MCP server for self-hosted [Manager.io](https://www.manager.io/): ask your AI about invoices, balances, and books.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -39,7 +41,54 @@ Default is **read-only**. You get:
 - **`raw` escape hatch** - restores the full CRUD set for advanced use
 - **Hard denylist** - access tokens, chart of accounts forms, tax/currency, email templates, and similar high-risk paths stay blocked even when writes are on
 
-Transport is **stdio**. No HTTP server. No global install required if you use [`uv`](https://docs.astral.sh/uv/) / `uvx`.
+Transport is **stdio** by default. No HTTP server. No global install required if you use [`uv`](https://docs.astral.sh/uv/) / `uvx`.
+
+## Fork-specific changes on this branch
+
+This fork adds a few capabilities that are not part of the upstream stdio-first server:
+
+- **Streamable HTTP transport** with `MANAGER_MCP_TRANSPORT=http` for remote MCP hosting
+- **Google OAuth session handling** for browser-based remote access, with email allowlisting and callback enforcement
+- **Health-check endpoint support** for deployment readiness and uptime monitoring
+- **File attachment support** using Manager's undocumented `NewAttachment` action flow for invoice and other supported attachments
+- **Purchase invoice attachment handling** and client-side support for Manager attachment payloads
+- **Line-item search improvements** via `search_line_items`, including fixes for description and key-name normalization
+- **Auth timeout configuration** for HTTP-backed sessions so remote deployments can tune idle expiry
+- **Hourly bank-feed sync** via a pluggable provider (Aussie Bank Feeds/Basiq built in; add your own for anything else), enabled with `MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS` — see [Bank-feed providers](#bank-feed-providers) below
+- **Browser setup UI** at `/setup/bank-feeds` (same Google login as the MCP transport) for configuring a bank-feed provider without hand-editing env vars
+
+These additions are designed for hosted or browser-connected deployments while preserving the original read-only defaults and write-scope model for local stdio use.
+
+### New tools and capabilities in this fork
+
+The branch adds features that are especially relevant for hosted deployments and document-heavy accounting workflows:
+
+- `search_line_items`
+  - searches text inside line item descriptions on Manager records such as invoices and quotes
+  - works around the limitation of `list_records` / `term`, which only searches header-level fields and misses text stored in individual line items
+  - returns paged results by fetching the underlying record forms and scanning the line descriptions
+
+- `attach_receipt_to_purchase_invoice`
+  - attaches a receipt image or PDF to a purchase invoice using Manager's undocumented `NewAttachment` action endpoint
+  - accepts a local file path, raw base64 content, or a remote HTTP(S) URL
+  - is intended for purchase invoice document workflows where the attachment has to be associated with the correct Manager record
+
+- HTTP transport mode for remote MCP hosting
+  - exposes the server over Streamable HTTP instead of stdio
+  - integrates with Google OAuth, a public base URL, and a permitted-email allowlist
+  - suitable for hosted MCP connectors that need browser-based login rather than a local machine process
+
+- Auth/session management for remote deployments
+  - supports configurable session timeout values for the HTTP transport
+  - keeps the local stdio workflow unchanged when no remote transport is configured
+
+- Health-check support
+  - includes a lightweight readiness/health endpoint so the service can be monitored by a reverse proxy or deployment system
+
+- Bank-feed sync on a timer
+  - runs inside this process when `MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS` is a positive number; unset or 0 disables it
+  - always authenticates as the mcp user (`MANAGER_UI_USERNAME` / `MANAGER_UI_PASSWORD`, HTTP Basic Auth) — every provider needs it
+  - which mechanism runs is pluggable; see [Bank-feed providers](#bank-feed-providers)
 
 ## Branding / icons
 
@@ -385,6 +434,10 @@ Dev from a clone: `uv run --directory /path/to/manager-mcp manager-mcp`.
 | `MANAGER_API_KEY` | yes | Sent as `X-API-KEY`; never logged |
 | `MANAGER_MCP_WRITE_SCOPES` | no | Comma-separated domains for create/update. Empty = no writes. |
 | `MANAGER_MCP_DELETE_SCOPES` | no | Comma-separated domains for delete only. Never implied by WRITE_SCOPES. |
+| `MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS` | no | Seconds between bank-feed imports, via whichever provider is configured (mcp user Basic Auth). Unset or 0 disables (default). Compose sets `3600`. |
+| `MANAGER_MCP_BANK_FEED_CONFIG_PATH` | no | Where provider config (below) is saved/read. Default `/secrets/manager/feeds.config`. See [Config lives in a file, not env vars](#config-lives-in-a-file-not-env-vars). |
+
+The rest of a provider's config (`MANAGER_MCP_BANK_FEED_PROVIDER`, `BASIQ_USERNAME`/`BASIQ_PASSWORD`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BASIQ_DEDUP_FIELD`, `MANAGER_MCP_BASIQ_TIMEZONE`, `MANAGER_MCP_BASIQ_LOOKBACK_DAYS`) is normally set via `/setup/bank-feeds`, saved to the file above, not this table's env vars — see [Bank-feed providers](#bank-feed-providers). They're still read as plain env vars too (e.g. for local dev), same names, if you'd rather set them that way.
 
 Valid scopes: `quotes`, `orders`, `parties`, `items`, `sales`, `purchases`, `banking`, `payroll`, `ledger`, `raw`. No wildcards (`*`, `all`).
 
@@ -400,6 +453,24 @@ Default with no scopes: **10 tools**. All nine domain scopes plus every CRUD ver
 Legacy `MANAGER_MCP_ALLOW_WRITES` / `ALLOW_WRITES` / `MANAGER_MCP_WRITES` hard-fail if set. Use the scoped vars instead.
 
 See [`.env.example`](.env.example). Prefer a secret manager for the API key in production configs.
+
+### Remote access (Streamable HTTP + Google OAuth)
+
+By default `manager-mcp` runs over stdio and has no transport-level auth of its own —
+whatever launches the process controls access. Set `MANAGER_MCP_TRANSPORT=http` to
+run Streamable HTTP instead, for a remote connector such as Claude Cowork. This
+requires Google OAuth config and is meant to sit behind a reverse proxy that
+terminates TLS.
+
+| Variable | Required for `http` | Notes |
+|----------|----------|-------|
+| `MANAGER_MCP_TRANSPORT` | — | `stdio` (default) or `http`. |
+| `MANAGER_MCP_HTTP_HOST` | no | Default `0.0.0.0`. |
+| `MANAGER_MCP_HTTP_PORT` | no | Default `8080`. |
+| `MANAGER_MCP_OAUTH_GOOGLE_CLIENT_ID` | yes | Google OAuth client, separate from any other service's. |
+| `MANAGER_MCP_OAUTH_GOOGLE_CLIENT_SECRET` | recommended | Omit only for a PKCE public client. |
+| `MANAGER_MCP_OAUTH_BASE_URL` | yes | Public HTTPS URL, e.g. `https://manager-mcp.example.com`. Redirect URI is `{base_url}/auth/callback`. |
+| `MANAGER_MCP_ALLOWED_EMAILS` | yes | Comma-separated. Google OAuth alone accepts any Google account that logs in; this allowlist is enforced on top of it. |
 
 ## Write scopes and task tools
 
@@ -507,6 +578,36 @@ Registered only for resources in enabled scopes. Prefer task tools above.
 Companion skill: [`skills/manager-accounting/SKILL.md`](skills/manager-accounting/SKILL.md).
 
 The Cursor plugin discovers this skill from `skills/`. Without the plugin, copy or symlink that folder into your agent skills path. It tells the model to call `list_resources` first, verify after writes, and which report tools to prefer.
+
+## Bank-feed providers
+
+Getting new bank transactions into Manager is provider-agnostic: `bank_feeds.py` only owns the timer and retry loop, and asks `bank_feed_providers.registry.select_provider()` for whichever provider is configured. One ships built in (`src/manager_mcp/bank_feed_providers/`):
+
+- **`basiq`** — Aussie Bank Feeds / Basiq. Auto-selected once `BASIQ_USERNAME`/`BASIQ_PASSWORD` are set. Needs `MANAGER_MCP_BASIQ_ACCOUNT_LINKS` (JSON, Manager bank account key → Basiq account id) and `MANAGER_MCP_BASIQ_DEDUP_FIELD` (a Manager custom field's key, used to avoid re-importing the same transaction). See `bank_feed_providers/basiq.py`'s module docstring for the reverse-engineering notes.
+
+`MANAGER_MCP_BANK_FEED_PROVIDER` picks one explicitly; left unset, the first configured provider wins (in `PROVIDERS` order in `registry.py`). If nothing is configured, `select_provider()` raises and callers (the sync loop, the `sync_bank_feeds` tool) turn that into a "not configured, here's the setup UI" result rather than a bare error.
+
+There used to be a second built-in provider using Manager's own "Check for New Transactions" control, kept as an always-available fallback. It was removed: that control only exists on older Manager installs that never got the Aussie Bank Feeds extension, and every deployment this runs against already uses Aussie Bank Feeds, so it never actually imported anything -- just failed on every attempt. See git history if a deployment genuinely needs it back. Manager ships other extensions (VAT/GST/BAS return preparation, various countries' e-invoicing, etc.) but none of them are bank-feed imports, so there's nothing else to add here yet -- see "Adding a provider" below and the setup UI's "Other" option.
+
+### Config lives in a file, not env vars
+
+Every provider's config (`BASIQ_USERNAME`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BANK_FEED_PROVIDER`, ...) is read through `bank_feed_providers.feeds_config.effective_environ()`, which overlays a saved JSON config file (default `/secrets/manager/feeds.config`, path in `MANAGER_MCP_BANK_FEED_CONFIG_PATH`) on top of `os.environ`. Plain env vars still work (e.g. for local dev without the setup UI), but the file takes precedence, and it's what the setup UI writes to — so provider credentials never need to go into `secrets/manager-mcp.env`. In compose, `./secrets/manager` is a separate read-write bind mount (see `compose.yaml`) and `.gitignore`'d entirely.
+
+Because it's read fresh on every attempt, saving a change (new credentials, a corrected account link, switching provider) takes effect on the next scheduled sync or the next `sync_bank_feeds` tool call — no restart needed.
+
+### Setup UI
+
+Under `MANAGER_MCP_TRANSPORT=http`, `/setup/bank-feeds` is a browser page — gated by the same Google OAuth client and `MANAGER_MCP_ALLOWED_EMAILS` allowlist used for the MCP endpoint itself — for configuring a provider without hand-editing anything. It reads what it can straight from Manager (bank & cash accounts, business name, custom fields already in use on existing receipts/payments) and only asks for what a provider says it can't get from Manager (e.g. the Aussie Bank Feeds login). For Basiq, entering that login lets the page also look up your linked Basiq accounts live. Submitting the form saves to the config file above.
+
+The Google OAuth client needs `{MANAGER_MCP_OAUTH_BASE_URL}/setup/callback` added to its Authorized redirect URIs in Google Cloud Console, alongside the existing `/auth/callback` used by the MCP transport — a manual, one-time step.
+
+### `sync_bank_feeds` tool
+
+A banking-scope MCP tool that runs a sync immediately, the same as the timer would. If nothing is configured yet, it returns `{"configured": false, "setup_url": ..., "hint": ...}` instead of raising — an agent should read that and tell the user to open `setup_url`, rather than treating it as a failure to retry.
+
+### Adding a provider
+
+Implement `BankFeedProvider` (`bank_feed_providers/base.py`): `name`, `is_configured(environ)`, `async sync(client)`, and optionally `async setup_state(client, environ)` to plug into the setup UI. Add an instance to `PROVIDERS` in `registry.py` — nothing else needs to change.
 
 ## Development
 
