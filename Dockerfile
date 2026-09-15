@@ -18,6 +18,12 @@ RUN uv sync --frozen --no-dev
 ENV MANAGER_MCP_TRANSPORT=http
 ENV MANAGER_MCP_HTTP_HOST=0.0.0.0
 ENV MANAGER_MCP_HTTP_PORT=8080
+# feeds_config.py defaults to /secrets/manager/feeds.config, which only
+# exists as a writable mount in the compose cluster (shared ./secrets/manager
+# bind mount). A standalone container has no such mount, so default the
+# bank-feed config into the app's own writable WORKDIR instead; compose.yaml
+# overrides this back to the shared secrets path for cluster deployments.
+ENV MANAGER_MCP_BANK_FEED_CONFIG_PATH=/app/feeds.config
 EXPOSE 8080
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s \

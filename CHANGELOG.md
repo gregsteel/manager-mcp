@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Docker image now sets `MANAGER_MCP_BANK_FEED_CONFIG_PATH=/app/feeds.config`
+  by default, so a standalone container (no shared `/secrets/manager` mount)
+  reads/writes bank-feed config inside its own writable `WORKDIR` instead of
+  the compose cluster's default `/secrets/manager/feeds.config`. Compose
+  still overrides the env var back to the shared secrets path.
+
 - Hourly bank-feed sync: when `MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS`
   is set (compose uses 3600), run whichever bank-feed provider is configured
   as the mcp user. Unset or 0 leaves the loop off.

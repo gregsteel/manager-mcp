@@ -435,7 +435,7 @@ Dev from a clone: `uv run --directory /path/to/manager-mcp manager-mcp`.
 | `MANAGER_MCP_WRITE_SCOPES` | no | Comma-separated domains for create/update. Empty = no writes. |
 | `MANAGER_MCP_DELETE_SCOPES` | no | Comma-separated domains for delete only. Never implied by WRITE_SCOPES. |
 | `MANAGER_MCP_BANK_FEED_SYNC_INTERVAL_SECONDS` | no | Seconds between bank-feed imports, via whichever provider is configured (mcp user Basic Auth). Unset or 0 disables (default). Compose sets `3600`. |
-| `MANAGER_MCP_BANK_FEED_CONFIG_PATH` | no | Where provider config (below) is saved/read. Default `/secrets/manager/feeds.config`. See [Config lives in a file, not env vars](#config-lives-in-a-file-not-env-vars). |
+| `MANAGER_MCP_BANK_FEED_CONFIG_PATH` | no | Where provider config (below) is saved/read. Defaults to `/app/feeds.config` in the Docker image (`/secrets/manager/feeds.config` if unset outside Docker); compose overrides it to the shared `/secrets/manager/feeds.config`. See [Config lives in a file, not env vars](#config-lives-in-a-file-not-env-vars). |
 
 The rest of a provider's config (`MANAGER_MCP_BANK_FEED_PROVIDER`, `BASIQ_USERNAME`/`BASIQ_PASSWORD`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BASIQ_DEDUP_FIELD`, `MANAGER_MCP_BASIQ_TIMEZONE`, `MANAGER_MCP_BASIQ_LOOKBACK_DAYS`) is normally set via `/setup/bank-feeds`, saved to the file above, not this table's env vars — see [Bank-feed providers](#bank-feed-providers). They're still read as plain env vars too (e.g. for local dev), same names, if you'd rather set them that way.
 
@@ -591,7 +591,9 @@ There used to be a second built-in provider using Manager's own "Check for New T
 
 ### Config lives in a file, not env vars
 
-Every provider's config (`BASIQ_USERNAME`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BANK_FEED_PROVIDER`, ...) is read through `bank_feed_providers.feeds_config.effective_environ()`, which overlays a saved JSON config file (default `/secrets/manager/feeds.config`, path in `MANAGER_MCP_BANK_FEED_CONFIG_PATH`) on top of `os.environ`. Plain env vars still work (e.g. for local dev without the setup UI), but the file takes precedence, and it's what the setup UI writes to — so provider credentials never need to go into `secrets/manager-mcp.env`. In compose, `./secrets/manager` is a separate read-write bind mount (see `compose.yaml`) and `.gitignore`'d entirely.
+Every provider's config (`BASIQ_USERNAME`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BANK_FEED_PROVIDER`, ...) is read through `bank_feed_providers.feeds_config.effective_environ()`, which overlays a saved JSON config file (path in `MANAGER_MCP_BANK_FEED_CONFIG_PATH`) on top of `os.environ`. Plain env vars still work (e.g. for local dev without the setup UI), but the file takes precedence, and it's what the setup UI writes to — so provider credentials never need to go into `secrets/manager-mcp.env`.
+
+The default path differs by how the container is run: bare (no env var set at all, e.g. running `manager-mcp` outside Docker) it's `/secrets/manager/feeds.config`; the Docker image sets `MANAGER_MCP_BANK_FEED_CONFIG_PATH=/app/feeds.config` so a standalone container — one with no shared secrets mount — reads/writes the config inside its own writable `WORKDIR` instead. In the compose cluster, `compose.yaml` overrides it back to `/secrets/manager/feeds.config`, backed by `./secrets/manager`, a separate read-write bind mount (see `compose.yaml`) and `.gitignore`'d entirely, so the config survives container recreation and can be shared/inspected from the host.
 
 Because it's read fresh on every attempt, saving a change (new credentials, a corrected account link, switching provider) takes effect on the next scheduled sync or the next `sync_bank_feeds` tool call — no restart needed.
 
