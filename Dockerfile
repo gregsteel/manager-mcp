@@ -20,8 +20,8 @@ ENV MANAGER_MCP_HTTP_HOST=0.0.0.0
 ENV MANAGER_MCP_HTTP_PORT=8080
 # MANAGER_MCP_BANK_FEED_CONFIG_PATH defaults to /app/feeds.config
 # (feeds_config.py), this WORKDIR, so no ENV override is needed here for a
-# standalone container; compose.yaml overrides it to the shared
-# /secrets/manager/feeds.config mount for cluster deployments.
+# standalone container; a deployment that wants it on a mounted volume
+# instead sets that env var to point there.
 EXPOSE 8080
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s \

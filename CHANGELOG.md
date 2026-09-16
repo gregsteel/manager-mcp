@@ -77,11 +77,11 @@ tools, file attachments, and bank-feed automation.
   connection to Manager was fine.
 
 - `feeds_config.py`'s default `MANAGER_MCP_BANK_FEED_CONFIG_PATH` is now
-  `/app/feeds.config` (the app's own writable `WORKDIR`), was
-  `/secrets/manager/feeds.config` -- a path that only exists as a writable
-  mount in the compose cluster, so a standalone container had nowhere to
-  write it. Compose still overrides the env var to the shared secrets path
-  for cluster deployments.
+  `/app/feeds.config` (this app's own writable `WORKDIR`) instead of a path
+  under `/secrets`, which assumed a mount that only exists in one
+  particular deployment's setup and left a standalone container with
+  nowhere to write it. A deployment that wants the file on a mounted
+  volume still sets the env var to point there.
 
 ## [0.2.6] - 2026-08-03
 

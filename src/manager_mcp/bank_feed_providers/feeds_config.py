@@ -10,10 +10,11 @@ the process environment: `effective_environ()` overlays it on `os.environ`
 and every provider function that takes an `environ` argument reads that.
 
 Where the file lives is itself an env var (`MANAGER_MCP_BANK_FEED_CONFIG_PATH`,
-default `/app/feeds.config` -- the app's own WORKDIR, writable in a
+default `/app/feeds.config` -- this app's own WORKDIR, writable in a
 standalone container) since the path isn't secret, only its contents are.
-compose.yaml overrides it to `/secrets/manager/feeds.config`, a shared
-bind mount, for cluster deployments.
+A deployment that wants the file to persist on a mount outside the
+container (e.g. a shared secrets volume) sets that env var to point there
+instead.
 """
 
 from __future__ import annotations
