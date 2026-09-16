@@ -591,11 +591,11 @@ There used to be a second built-in provider using Manager's own "Check for New T
 
 ### Config lives in a file, not env vars
 
-Every provider's config (`BASIQ_USERNAME`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BANK_FEED_PROVIDER`, ...) is read through `bank_feed_providers.feeds_config.effective_environ()`, which overlays a saved JSON config file (path in `MANAGER_MCP_BANK_FEED_CONFIG_PATH`) on top of `os.environ`. Plain env vars still work (e.g. for local dev without the setup UI), but the file takes precedence, and it's what the setup UI writes to — so provider credentials never need to go into `secrets/manager-mcp.env`.
+Provider config (`BASIQ_USERNAME`, `MANAGER_MCP_BASIQ_ACCOUNT_LINKS`, `MANAGER_MCP_BANK_FEED_PROVIDER`, ...) doesn't have to be set as env vars — it can instead be saved to a JSON file, which is what the setup UI writes to. That way, provider credentials entered through the UI never need to go into `secrets/manager-mcp.env` or any other env-var source.
 
-The default path, `/app/feeds.config`, is this app's own writable `WORKDIR` — fine for a standalone container. A deployment that wants the file to survive container recreation, or to be shared/inspected from the host, sets `MANAGER_MCP_BANK_FEED_CONFIG_PATH` to a mounted volume instead.
-
-Because it's read fresh on every attempt, saving a change (new credentials, a corrected account link, switching provider) takes effect on the next scheduled sync or the next `sync_bank_feeds` tool call — no restart needed.
+- **Where it's read from:** every provider function reads its config through `bank_feed_providers.feeds_config.effective_environ()`, which merges the saved file on top of `os.environ`. Plain env vars still work — e.g. for local dev without the setup UI — but a value in the file wins if both are set.
+- **Where the file lives:** path is `MANAGER_MCP_BANK_FEED_CONFIG_PATH`, default `/app/feeds.config` (this app's own writable `WORKDIR` — fine for a standalone container). Point it at a mounted volume instead if you want the file to survive container recreation, or to be shared/inspected from the host.
+- **When changes take effect:** the file is read fresh on every attempt, so saving a change (new credentials, a corrected account link, switching provider) applies on the next scheduled sync or the next `sync_bank_feeds` tool call — no restart needed.
 
 ### Setup UI
 
