@@ -12,8 +12,8 @@ one-time step, same as registering the MCP callback was.
 
 This page never writes to Manager -- it only reads from it (bank accounts,
 business name, custom fields already in use). What an operator submits is
-saved to the bank-feed config file (`feeds_config.py`, default
-`/secrets/manager/feeds.config`), not to `secrets/manager-mcp.env` and not
+saved to the bank-feed config file (`feeds_config.py`, path in
+`MANAGER_MCP_BANK_FEED_CONFIG_PATH`), not to `secrets/manager-mcp.env` and not
 committed anywhere -- and every provider reads that file live, so a saved
 change (a new Basiq login, a corrected account link) takes effect on the
 next scheduled sync or the next `sync_bank_feeds` tool call, no restart

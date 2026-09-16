@@ -76,11 +76,12 @@ tools, file attachments, and bank-feed automation.
   `bank_balances` repeatedly needing/failing approval even though the
   connection to Manager was fine.
 
-- Docker image now sets `MANAGER_MCP_BANK_FEED_CONFIG_PATH=/app/feeds.config`
-  by default, so a standalone container (no shared `/secrets/manager` mount)
-  reads/writes bank-feed config inside its own writable `WORKDIR` instead of
-  the compose cluster's `/secrets/manager/feeds.config`. Compose still
-  overrides the env var back to the shared secrets path.
+- `feeds_config.py`'s default `MANAGER_MCP_BANK_FEED_CONFIG_PATH` is now
+  `/app/feeds.config` (the app's own writable `WORKDIR`), was
+  `/secrets/manager/feeds.config` -- a path that only exists as a writable
+  mount in the compose cluster, so a standalone container had nowhere to
+  write it. Compose still overrides the env var to the shared secrets path
+  for cluster deployments.
 
 ## [0.2.6] - 2026-08-03
 

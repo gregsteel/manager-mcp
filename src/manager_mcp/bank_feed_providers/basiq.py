@@ -35,8 +35,8 @@ whenever they post after local midnight) and `MANAGER_MCP_BASIQ_LOOKBACK_DAYS`
 
 All of the above are ordinary env-var names, but every function here reads
 them through `environ`, which defaults to
-`feeds_config.effective_environ()` -- `os.environ` overlaid with
-`secrets/manager/feeds.config` (see that module). In practice that means
+`feeds_config.effective_environ()` -- `os.environ` overlaid with the saved
+bank-feed config file (see that module). In practice that means
 these normally come from the setup UI's saved config file, not from
 `secrets/manager-mcp.env`; env vars still work (e.g. for local dev) but the
 file wins if both are set.
