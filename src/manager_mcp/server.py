@@ -35,6 +35,13 @@ _PERIOD_ALIASES = {
     "to": "toDate",
 }
 
+_READ_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+
 _ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.png"
 _ICON_HTTPS = (
     "https://raw.githubusercontent.com/flumpiey/manager-mcp/main/docs/icon-512.png"
@@ -159,7 +166,8 @@ async def _fetch_report(name: str, **period: Any) -> dict[str, Any]:
         "List curated Manager.io capabilities. Default is read-only (10 tools). "
         "Task tools register when write scopes match; CRUD tools are deprecated "
         "unless raw scope is set."
-    )
+    ),
+    annotations=_READ_ANNOTATIONS,
 )
 async def list_resources() -> dict[str, Any]:
     policy = get_policy()
@@ -207,7 +215,8 @@ async def list_resources() -> dict[str, Any]:
         "purchase_invoices, chart_of_accounts, bank_accounts. Also writable domains "
         "when present in discovery (e.g. receipts, payments, sales_quotes). "
         "bank_accounts is the searchable collection; use bank_balances for snapshot balances."
-    )
+    ),
+    annotations=_READ_ANNOTATIONS,
 )
 async def list_records(
     resource: str,
@@ -256,7 +265,8 @@ async def list_records(
         "Fetch one collection record by GUID via Manager form endpoint "
         "(e.g. /customer-form/{key}). chart_of_accounts has no single form. "
         "For bank/cash account detail use resource=bank_accounts (not bank_balances)."
-    )
+    ),
+    annotations=_READ_ANNOTATIONS,
 )
 async def get_record(resource: str, key: str) -> dict[str, Any]:
     path = form_path(resource, key)
@@ -285,7 +295,8 @@ async def get_record(resource: str, key: str) -> dict[str, Any]:
         "only records with at least one matching line (case-insensitive substring match). "
         "Costs one extra Manager API call per header scanned, so page_size defaults small; "
         "page with `skip` (see `has_more`) to cover a whole collection."
-    )
+    ),
+    annotations=_READ_ANNOTATIONS,
 )
 async def search_line_items(
     resource: str,
@@ -355,7 +366,10 @@ async def search_line_items(
     }
 
 
-@mcp.tool(description="Aged receivables / outstanding customer balances (read-only snapshot).")
+@mcp.tool(
+    description="Aged receivables / outstanding customer balances (read-only snapshot).",
+    annotations=_READ_ANNOTATIONS,
+)
 async def aged_receivables(
     from_date: str | None = None,
     to_date: str | None = None,
@@ -363,7 +377,7 @@ async def aged_receivables(
     return await _fetch_report("aged_receivables", from_date=from_date, to_date=to_date)
 
 
-@mcp.tool(description="Aged payables snapshot (read-only).")
+@mcp.tool(description="Aged payables snapshot (read-only).", annotations=_READ_ANNOTATIONS)
 async def aged_payables(
     from_date: str | None = None,
     to_date: str | None = None,
@@ -375,7 +389,8 @@ async def aged_payables(
     description=(
         "Bank/cash balances snapshot (read-only). "
         "For search/drill-in of individual accounts use list_records/get_record on bank_accounts."
-    )
+    ),
+    annotations=_READ_ANNOTATIONS,
 )
 async def bank_balances(
     from_date: str | None = None,
@@ -384,7 +399,7 @@ async def bank_balances(
     return await _fetch_report("bank_balances", from_date=from_date, to_date=to_date)
 
 
-@mcp.tool(description="Trial balance snapshot (read-only).")
+@mcp.tool(description="Trial balance snapshot (read-only).", annotations=_READ_ANNOTATIONS)
 async def trial_balance(
     from_date: str | None = None,
     to_date: str | None = None,
@@ -392,7 +407,7 @@ async def trial_balance(
     return await _fetch_report("trial_balance", from_date=from_date, to_date=to_date)
 
 
-@mcp.tool(description="Profit and loss snapshot (read-only).")
+@mcp.tool(description="Profit and loss snapshot (read-only).", annotations=_READ_ANNOTATIONS)
 async def profit_and_loss(
     from_date: str | None = None,
     to_date: str | None = None,
@@ -400,7 +415,7 @@ async def profit_and_loss(
     return await _fetch_report("profit_and_loss", from_date=from_date, to_date=to_date)
 
 
-@mcp.tool(description="Balance sheet snapshot (read-only).")
+@mcp.tool(description="Balance sheet snapshot (read-only).", annotations=_READ_ANNOTATIONS)
 async def balance_sheet(
     from_date: str | None = None,
     to_date: str | None = None,
@@ -408,7 +423,7 @@ async def balance_sheet(
     return await _fetch_report("balance_sheet", from_date=from_date, to_date=to_date)
 
 
-@mcp.tool(description="Tax summary snapshot (read-only).")
+@mcp.tool(description="Tax summary snapshot (read-only).", annotations=_READ_ANNOTATIONS)
 async def tax_summary(
     from_date: str | None = None,
     to_date: str | None = None,

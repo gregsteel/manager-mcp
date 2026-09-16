@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Read-only tools (`list_resources`, `list_records`, `get_record`,
+  `search_line_items`, and the report tools including `bank_balances`)
+  now declare `readOnlyHint: true` MCP annotations. Previously they had no
+  annotations at all, which some MCP clients (e.g. Claude Cowork) treat as
+  "not confirmed read-only" and gate behind an approval prompt on every
+  call -- seen as `bank_balances` repeatedly needing/failing approval even
+  though the connection to Manager was fine.
+
 ### Added
 
 - Docker image now sets `MANAGER_MCP_BANK_FEED_CONFIG_PATH=/app/feeds.config`
