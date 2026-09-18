@@ -84,6 +84,28 @@ _BASE_RESOURCES: dict[str, ResourceDescriptor] = {
         form_template="/bank-or-cash-account-form/{key}",
         items_key="bankAndCashAccounts",
     ),
+    "payment_rules": _collection(
+        "payment_rules",
+        "/payment-rules",
+        "Payment rules collection (auto-categorization rules for outgoing bank "
+        "transactions, formerly \"Bank Rules\"; list/search only, no create/update/"
+        "delete endpoint in the Manager API)",
+        form_template=None,
+        items_key="paymentRules",
+    ),
+    "receipt_rules": _collection(
+        "receipt_rules",
+        "/receipt-rules",
+        "Receipt rules collection (auto-categorization rules for incoming bank "
+        "transactions; list/search only, no create/update/delete endpoint in the "
+        "Manager API)",
+        form_template=None,
+        items_key="receiptRules",
+    ),
+    # items_key for payment_rules/receipt_rules is a camelCase guess (matches
+    # the pattern of every other collection below) — not yet confirmed against
+    # a live envelope. extract_items() falls back to "items" or a raw wrap if
+    # the guess is wrong, so a mismatch degrades rather than breaks.
     # Reports: Manager "*-form" report builders require POST (writes). v1 uses
     # GET-only equivalents validated live — customers/suppliers AR/AP fields,
     # bank-and-cash list balances, and *-transactions statement feeds.

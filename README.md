@@ -557,9 +557,9 @@ Required scopes: `banking`, `quotes` (deposit doc), `ledger` (apply), `sales` (f
 | `balance_sheet` | Balance sheet | Forwarded as `fromDate` / `toDate` |
 | `tax_summary` | Tax summary | Accepted; may be unsupported on this view |
 
-Collections for `list_records` / `get_record`: `customers`, `suppliers`, `sales_invoices`, `purchase_invoices`, `chart_of_accounts`, `bank_accounts`.
+Collections for `list_records` / `get_record`: `customers`, `suppliers`, `sales_invoices`, `purchase_invoices`, `chart_of_accounts`, `bank_accounts`, `payment_rules`, `receipt_rules`.
 
-`chart_of_accounts` is list/search only (no single-form GET).
+`chart_of_accounts` is list/search only (no single-form GET). `payment_rules` (outgoing bank transaction auto-categorization, formerly "Bank Rules") and `receipt_rules` (incoming) are also list/search only - the Manager API has no create/update/delete endpoint for either.
 
 **Bank dual path (intentional):** `bank_balances` answers “what are my balances?”; `list_records` / `get_record` on `bank_accounts` answers “find account X and show detail.”
 

@@ -63,6 +63,12 @@ tools, file attachments, and bank-feed automation.
 - `search_line_items` tool: text search inside line-item descriptions,
   which `list_records`' header-only `term` search misses.
 
+- `payment_rules` and `receipt_rules` collections for `list_records` /
+  `get_record` — auto-categorization rules for outgoing and incoming bank
+  transactions respectively (`payment_rules` was formerly named "Bank
+  Rules" in the Manager UI). Both are list/search only; the Manager API has
+  no create/update/delete endpoint for either.
+
 - Docker packaging (`Dockerfile`, `.dockerignore`, `.env.example`) for
   running manager-mcp as a container — previously stdio/local-host only.
 
