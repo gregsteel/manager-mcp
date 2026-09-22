@@ -16,6 +16,40 @@ from manager_mcp.writable import WRITABLE, WritableResource
 from manager_mcp.write_validate import diff_persisted, validate_write_body
 
 
+async def _fetch_file_url(url: str) -> tuple[bytes | None, str]:
+    """Fetch bytes from an arbitrary HTTP(S) URL.
+
+    Returns `(bytes, filename)` on success, or `(None, error message)` on
+    failure — the caller distinguishes the two by checking whether the first
+    element is `None`.
+    """
+    import mimetypes
+    from urllib.parse import unquote, urlparse
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as fetch_client:
+            response = await fetch_client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return None, f"Could not fetch file_url: {exc}"
+
+    name = ""
+    content_disposition = response.headers.get("content-disposition", "")
+    if "filename=" in content_disposition:
+        name = content_disposition.split("filename=", 1)[1].strip('"; ')
+    if not name:
+        path_name = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+        if path_name and "." in path_name:
+            name = path_name
+    if not name:
+        content_type = response.headers.get("content-type", "").split(";")[0].strip()
+        name = f"attachment{mimetypes.guess_extension(content_type) or ''}"
+
+    return response.content, name
+
+
 def _body_key(body: Any) -> str:
     return body.get("Key", "") if isinstance(body, dict) else ""
 
@@ -470,4 +504,202 @@ async def apply_deposit_to_invoice(
         body=out["body"],
         warnings=out["warnings"],
         next_steps=["Verify invoice balance and customer available credit with reads."],
+    )
+
+
+async def attach_receipt_to_purchase_invoice(
+    client: ManagerClient,
+    policy: WritePolicy,
+    invoice_key: str,
+    file_path: str | None = None,
+    file_content_base64: str | None = None,
+    file_name: str | None = None,
+    file_url: str | None = None,
+    search_term: str | None = None,
+) -> dict[str, Any]:
+    """Attach a receipt image/PDF to a purchase invoice.
+
+    Routed by the file's type, matching Manager's own Edit-page upload
+    control (which only accepts image/jpeg or image/png): images go to the
+    legacy per-document Image field (shown on the Edit page); anything else
+    (e.g. a PDF) goes to Manager's general Attachments list (paperclip icon
+    / View page) instead, since that field can't hold it.
+
+    Pass exactly one source: `file_path` (readable on the machine running
+    this server), `file_content_base64` + `file_name` (raw bytes a caller
+    already has in memory), or `file_url` (any plain HTTP(S) URL this server
+    fetches directly — e.g. a pre-signed, short-lived link from another MCP
+    server that has no filesystem to stage a file on). This server has no
+    knowledge of what issued the URL; it just does a GET.
+
+    /api2 has no JSON attachment endpoint. This uses
+    manager_mcp.attachments_api's undocumented action endpoints, reusing
+    the same authenticated API session — see that module's docstring for
+    what they do and why they're unsupported/fragile.
+    """
+    require_write_scopes(policy, "purchases")
+
+    from manager_mcp.attachments_api import (
+        ApiAttachmentError,
+        attach_file_via_api,
+        attach_image_field_via_api,
+    )
+
+    file_bytes: bytes | None = None
+    if file_content_base64 is not None:
+        if not file_name:
+            return _envelope(
+                "error",
+                keys={"purchase_invoice": invoice_key},
+                warnings=["file_name is required when passing file_content_base64."],
+            )
+        import base64
+
+        try:
+            file_bytes = base64.b64decode(file_content_base64, validate=True)
+        except ValueError as exc:
+            return _envelope(
+                "error",
+                keys={"purchase_invoice": invoice_key},
+                warnings=[f"file_content_base64 is not valid base64: {exc}"],
+            )
+    elif file_url is not None:
+        file_bytes, resolved_name = await _fetch_file_url(file_url)
+        if file_bytes is None:
+            return _envelope(
+                "error",
+                keys={"purchase_invoice": invoice_key},
+                warnings=[resolved_name],  # holds the error message in this branch
+            )
+        file_name = file_name or resolved_name
+    elif file_path is None:
+        return _envelope(
+            "error",
+            keys={"purchase_invoice": invoice_key},
+            warnings=[
+                "Pass exactly one of: file_path, file_content_base64 + "
+                "file_name, or file_url."
+            ],
+        )
+
+    invoice = await client.get(f"{WRITABLE['purchase_invoices'].form_path}/{invoice_key}")
+    if not isinstance(invoice, dict):
+        return _envelope(
+            "error",
+            keys={"purchase_invoice": invoice_key},
+            warnings=[f"Purchase invoice not found: {invoice_key}"],
+        )
+
+    term = search_term or str(invoice.get("Description") or "")
+    if not term:
+        return _envelope(
+            "error",
+            keys={"purchase_invoice": invoice_key},
+            warnings=[
+                "No search_term given and the invoice has no Description to "
+                "search by. Pass search_term explicitly."
+            ],
+        )
+
+    envelope = await client.get(
+        WRITABLE["purchase_invoices"].list_path, params={"pageSize": 1}
+    )
+    business_name = ""
+    if isinstance(envelope, dict):
+        business_name = str((envelope.get("business") or {}).get("name") or "")
+    if not business_name:
+        return _envelope(
+            "error",
+            keys={"purchase_invoice": invoice_key},
+            warnings=["Could not determine business name from Manager's API response."],
+        )
+
+    ui_base_url = client.base_url.rsplit("/api2", 1)[0]
+
+    # Manager's Image field only accepts image/jpeg and image/png (see its
+    # <input accept="image/jpeg, image/png, image/jpg">) — anything else
+    # (e.g. a PDF) can only go in the general Attachments list.
+    import mimetypes
+    from pathlib import Path
+
+    resolved_name = file_name or (Path(file_path).name if file_path else None)
+    mime_type = mimetypes.guess_type(resolved_name)[0] if resolved_name else None
+    is_image = mime_type in {"image/jpeg", "image/png"}
+
+    if is_image:
+        try:
+            await attach_image_field_via_api(
+                client,
+                ui_base_url=ui_base_url,
+                business_name=business_name,
+                invoice_key=invoice_key,
+                file_path=file_path,
+                file_bytes=file_bytes,
+                file_name=file_name,
+            )
+        except ApiAttachmentError as exc:
+            return _envelope(
+                "error",
+                keys={"purchase_invoice": invoice_key},
+                warnings=[
+                    "The unsupported attachment upload API may have changed. "
+                    f"Detail: {exc}"
+                ],
+            )
+
+        # Verify through /api2's Image field (null when unattached, an HTML
+        # snippet referencing showImage(...) when set) rather than trusting
+        # the upload response, which is a bare 200/HX-Refresh either way.
+        verify = await client.get(
+            WRITABLE["purchase_invoices"].list_path,
+            params={"term": term, "pageSize": 50, "fields": "Image"},
+        )
+        matched_row = None
+        if isinstance(verify, dict):
+            for row in verify.get(WRITABLE["purchase_invoices"].items_key) or []:
+                if isinstance(row, dict) and (row.get("key") or row.get("Key")) == invoice_key:
+                    matched_row = row
+                    break
+
+        if not matched_row or not matched_row.get("image"):
+            return _envelope(
+                "error",
+                keys={"purchase_invoice": invoice_key},
+                warnings=[
+                    "Upload flow completed but the invoice's Image field is "
+                    "still empty afterwards — attachment may not have "
+                    "persisted."
+                ],
+            )
+
+        return _envelope(
+            "ok",
+            keys={"purchase_invoice": invoice_key},
+            next_steps=["Attachment saved to the Image field and verified via /api2."],
+        )
+
+    try:
+        await attach_file_via_api(
+            client,
+            ui_base_url=ui_base_url,
+            business_name=business_name,
+            invoice_key=invoice_key,
+            file_path=file_path,
+            file_bytes=file_bytes,
+            file_name=file_name,
+        )
+    except ApiAttachmentError as exc:
+        return _envelope(
+            "error",
+            keys={"purchase_invoice": invoice_key},
+            warnings=[
+                "The unsupported attachment upload API may have changed. "
+                f"Detail: {exc}"
+            ],
+        )
+
+    return _envelope(
+        "ok",
+        keys={"purchase_invoice": invoice_key},
+        next_steps=["Attachment saved to Manager's Attachments list."],
     )
