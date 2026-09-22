@@ -11,6 +11,8 @@ CORE_COLLECTIONS = {
     "purchase_invoices",
     "chart_of_accounts",
     "bank_accounts",
+    "payment_rules",
+    "receipt_rules",
 }
 # Synced from writable.py so create_* results can be verified via get_record.
 WRITABLE_COLLECTIONS = {

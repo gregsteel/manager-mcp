@@ -149,3 +149,20 @@ async def test_client_500_is_manager_api_error() -> None:
     with pytest.raises(ManagerApiError, match="PaidBy"):
         await client.post("/receipt-form", json=VALID_RECEIPT)
     await client.aclose()
+
+
+def test_merge_onto_existing_preserves_dedup_field_and_omitted_fields() -> None:
+    from manager_mcp.server import _merge_onto_existing
+
+    existing = {
+        "Date": "2026-09-19",
+        "Description": "VISA-LINKT",
+        "CustomFields2": {"Strings": {"dedup": "basiq-1", "other": "a"}},
+    }
+    merged = _merge_onto_existing(
+        existing, {"Lines": [{"Amount": 5}], "CustomFields2": {"Strings": {"other": "b"}}}
+    )
+    assert merged["Description"] == "VISA-LINKT"
+    assert merged["Date"] == "2026-09-19"
+    assert merged["Lines"] == [{"Amount": 5}]
+    assert merged["CustomFields2"]["Strings"] == {"dedup": "basiq-1", "other": "b"}

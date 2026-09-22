@@ -37,6 +37,8 @@ class ManagerClient:
         client: httpx.AsyncClient | None = None,
         extra_query_keys: frozenset[str] | None = None,
         policy: WritePolicy | None = None,
+        ui_username: str | None = None,
+        ui_password: str | None = None,
     ) -> None:
         if not base_url or not base_url.strip():
             raise ConfigError("MANAGER_API_URL is required")
@@ -52,6 +54,21 @@ class ManagerClient:
             headers={"X-API-KEY": self._api_key},
             timeout=60.0,
         )
+        # X-API-KEY only authenticates /api2 — Manager's own web UI/action
+        # endpoints (used by manager_mcp.attachments_api's raw_get/raw_post)
+        # need an actual logged-in session, which Manager also accepts as
+        # HTTP Basic Auth against a real Manager user (see
+        # https://github.com/isotherm/python-manager-api, which authenticates
+        # this way). Optional: attachment uploads via the undocumented
+        # endpoints simply fail with 302s to "/" without it.
+        self._ui_auth = (
+            httpx.BasicAuth(ui_username, ui_password) if ui_username and ui_password else None
+        )
+
+    @property
+    def has_ui_auth(self) -> bool:
+        """True when MANAGER_UI_USERNAME/PASSWORD were supplied (the mcp user)."""
+        return self._ui_auth is not None
 
     @classmethod
     def from_env(
@@ -65,6 +82,8 @@ class ManagerClient:
             os.environ.get("MANAGER_API_KEY", ""),
             extra_query_keys=extra_query_keys,
             policy=policy if policy is not None else WritePolicy.from_env(),
+            ui_username=os.environ.get("MANAGER_UI_USERNAME") or None,
+            ui_password=os.environ.get("MANAGER_UI_PASSWORD") or None,
         )
 
     def clean_params(self, params: dict[str, Any] | None) -> dict[str, Any]:
@@ -136,6 +155,58 @@ class ManagerClient:
         if not response.content:
             return None
         return response.json()
+
+    async def raw_get(self, url: str) -> httpx.Response:
+        """GET an absolute URL (e.g. a non-/api2 UI page) using this
+        client's underlying session, plus HTTP Basic Auth from
+        MANAGER_UI_USERNAME/MANAGER_UI_PASSWORD if configured (Manager's own
+        web UI ignores X-API-KEY; see the comment on `self._ui_auth`) — see
+        `raw_post`."""
+        return await self._client.get(url, auth=self._ui_auth)
+
+    async def raw_post(
+        self,
+        url: str,
+        *,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """POST to an absolute URL (e.g. a non-/api2 action endpoint) using
+        this client's underlying session — same host, same X-API-KEY header
+        plus HTTP Basic Auth if configured (see `raw_get`) — but bypassing
+        `_send`'s JSON-only/error-wrapping behaviour so the caller can
+        inspect the raw response itself (e.g. to detect a login redirect
+        rather than a genuine API failure)."""
+        return await self._client.post(url, data=data, files=files, auth=self._ui_auth)
+
+    async def raw_basic(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: Any = None,
+    ) -> httpx.Response:
+        """Call a Manager UI/`/api/` path with HTTP Basic Auth only (the mcp user).
+
+        Does not send `X-API-KEY` (that header is `/api2` only). Optional
+        extra headers are for UI actions that expect HTMX (`HX-Request`), or
+        for `/api4` calls that need `Manager-Business: <name>`. `json_body`
+        covers `/api4`'s JSON-body writes (confirmed working via HTTP Basic
+        Auth on 2026-08-31 — /api4/receipt-batch and /payment-batch, same
+        payload shape Manager's own frontend posts).
+        """
+        if self._ui_auth is None:
+            raise ConfigError(
+                "MANAGER_UI_USERNAME and MANAGER_UI_PASSWORD are required "
+                "to call Manager UI actions (the mcp user). X-API-KEY only covers /api2."
+            )
+        async with httpx.AsyncClient(
+            timeout=self._client.timeout,
+            auth=self._ui_auth,
+            follow_redirects=False,
+        ) as client:
+            return await client.request(method, url, headers=headers, json=json_body)
 
     async def aclose(self) -> None:
         if self._owns_client:

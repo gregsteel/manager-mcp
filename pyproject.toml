@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
   "fastmcp>=2.0",
   "httpx",
+  "tzdata",
 ]
 
 [project.urls]

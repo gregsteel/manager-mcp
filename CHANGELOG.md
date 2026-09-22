@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+Everything below is fork-specific, added on top of upstream
+[flumpiey/manager-mcp](https://github.com/flumpiey/manager-mcp) (diverged at
+`c50c4d7`), covering the remote HTTP/OAuth transport, intent-shaped task
+tools, file attachments, and bank-feed automation.
+
+### Added
+
+- Remote Streamable HTTP transport with Google OAuth and email allowlisting
+- Intent-shaped task tools (issue/record/post/void/etc.) replacing raw CRUD as the recommended write path
+- File-attachment support for purchase invoices via undocumented Manager endpoints
+- `ManagerClient` UI-session auth (HTTP Basic) for endpoints that ignore the API key
+- Pluggable bank-feed providers with Basiq (Aussie Bank Feeds) built in, hourly sync, and a browser setup UI
+- `search_line_items` tool for text search inside line-item descriptions
+- `payment_rules` and `receipt_rules` collections for transaction auto-categorization
+- Docker packaging for running manager-mcp as a container
+
+### Fixed
+
+- Read-only tools now declare `readOnlyHint: true`, fixing spurious approval prompts in some MCP clients
+
 ## [0.2.6] - 2026-08-03
 
 ### Fixed
